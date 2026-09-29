@@ -1,23 +1,5 @@
 import numpy as np
-import sqlite3
 import pandas as pd
-
-
-def parse_minutes(time):
-    if pd.isna(time) or time == "":
-        return 0.0
-    if isinstance(time, (int, float)):
-        return float(time)
-    if isinstance(time, str) and ":" in time:
-        parts = time.split(":")
-        try:
-            return float(parts[0]) + float(parts[1]) / 60.0
-        except (ValueError, IndexError):
-            return 0.0
-    try:
-        return float(time)
-    except ValueError:
-        return 0.0
 
 
 def find_player_impact(df_inactive: pd.DataFrame) -> pd.DataFrame:
@@ -63,7 +45,7 @@ def find_player_impact(df_inactive: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(by=["player_id", "game_id"]).reset_index(drop=True)
     group = df.groupby("player_id")[["pts", "min"]]
     avg = group.shift(1).rolling(7, min_periods=3).mean()
-    df["wage"] = avg["pts"] * (avg["min"] / 40.0)
+    df["wage"] = avg["pts"] * (avg["min"] / 48.0)
 
     merged = df_inactive.merge(
         df[["game_id", "player_id", "wage"]], on=["game_id", "player_id"]
@@ -80,7 +62,6 @@ def process_data(
     other_stats: str = "csv/other_stats.csv",
     inactive: str = "csv/inactive_players.csv",
     output: str = "training_data.csv",
-    games_to_analyze: int = 7,
 ) -> pd.DataFrame:
     df = pd.read_csv(game)
     df = df[df["season_type"].isin(["Regular Season", "Playoffs"])].copy()
@@ -100,11 +81,6 @@ def process_data(
     df["pace"] = (game_possesion / df["min"]) * 240.0
     df["ortg_home"] = (df["pts_home"] * 100.0) / possesion_home.replace(0, np.nan)
     df["ortg_away"] = (df["pts_away"] * 100.0) / possesion_away.replace(0, np.nan)
-
-    temp_df = pd.read_csv(other_stats)[
-        ["game_id", "pts_paint_home", "pts_paint_away", "pts_fb_home", "pts_fb_away"]
-    ]
-    df = df.merge(temp_df, on="game_id", how="left")
 
     df_inactive = pd.read_csv(inactive)
     df_impact = find_player_impact(df_inactive)
@@ -144,8 +120,6 @@ def process_data(
             "ortg": df["ortg_home"],
             "drtg": df["ortg_away"],
             "pace": df["pace"],
-            "pts_paint": df["pts_paint_home"],
-            "pts_fb": df["pts_fb_home"],
         }
     )
     away = pd.DataFrame(
@@ -159,8 +133,6 @@ def process_data(
             "ortg": df["ortg_away"],
             "drtg": df["ortg_home"],
             "pace": df["pace"],
-            "pts_paint": df["pts_paint_away"],
-            "pts_fb": df["pts_fb_away"],
         }
     )
     team_stats = pd.concat([home, away], ignore_index=True)
@@ -174,20 +146,33 @@ def process_data(
         "pts_scored",
         "pts_lost",
         "pace",
-        "pts_paint",
-        "pts_fb",
     ]
     for col in cols:
         team_stats[f"avg_{col}"] = (
             ## shift zapobiega data lekage
-            group[col].shift(1).rolling(games_to_analyze, min_periods=3).mean()
+            group[col].shift(1).rolling(7, min_periods=3).mean()
+        )
+    team_stats["net_rating"] = team_stats["avg_ortg"] - team_stats["avg_drtg"]
+
+    for col in ["ortg", "drtg", "pace"]:
+        team_stats[f"long_avg_{col}"] = (
+            group[col].shift(1).rolling(20, min_periods=7).mean()
         )
 
+    team_stats["long_net_rating"] = (
+        team_stats["long_avg_ortg"] - team_stats["long_avg_drtg"]
+    )
     ## shift znowu zapobiega data leckage
     days_diff = (team_stats["game_date"] - group["game_date"].shift(1)).dt.days
     team_stats["rest_days"] = days_diff.fillna(3).clip(lower=0, upper=7)
+    team_stats["b2b"] = (team_stats["rest_days"] <= 1).astype(int)
 
-    features_cols = [f"avg_{col}" for col in cols] + ["rest_days"]
+    features_cols = (
+        [f"avg_{col}" for col in cols]
+        + ["rest_days", "net_rating"]
+        + [f"long_avg_{col}" for col in ["ortg", "drtg", "pace"]]
+        + ["long_net_rating", "rest_days", "b2b"]
+    )
 
     sub_home = team_stats.loc[team_stats["is_home"] == 1]
     features_home = sub_home[features_cols].add_suffix("_home")
@@ -218,7 +203,7 @@ def process_data(
     result["total"] = result["pts_home"] + result["pts_away"]
     result["projected_pace"] = (result["avg_pace_home"] + result["avg_pace_away"]) / 2.0
 
-    result.to_parquet(output, index=False)
+    result.to_csv(output, index=False)
 
     return result
 
