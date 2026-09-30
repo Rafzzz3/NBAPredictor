@@ -1,0 +1,324 @@
+from datetime import date
+import pandas as pd
+import streamlit as st
+from nba_loader import get_all_teams, get_player_impacts, get_team_stats
+from prediction import predict_match
+
+st.set_page_config(
+    page_title="NBA Analytics Hub | Game Simulator",
+    layout="wide",
+    page_icon="🏀",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Teko:wght@500;700&family=Inter:wght@400;600;700&display=swap');
+
+    .stApp {
+        background: radial-gradient(circle at 50% 10%, #151d2a 0%, #0b0e14 100%);
+        color: #e5e7eb;
+        font-family: 'Inter', sans-serif;
+    }
+
+    .main-header {
+        font-family: 'Teko', sans-serif;
+        font-size: 3.2rem;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        margin-bottom: 0px;
+        background: linear-gradient(90deg, #ff8a00, #e52e71);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .sub-header {
+        color: #94a3b8;
+        font-size: 0.95rem;
+        margin-bottom: 1.5rem;
+    }
+
+    .team-card {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 16px;
+        padding: 20px;
+        backdrop-filter: blur(12px);
+        margin-bottom: 15px;
+    }
+    .home-glow {
+        border-left: 4px solid #3b82f6;
+    }
+    .away-glow {
+        border-left: 4px solid #ef4444;
+    }
+
+    .scoreboard {
+        background: linear-gradient(180deg, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 0.95) 100%);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 20px;
+        padding: 28px;
+        text-align: center;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        margin: 20px 0;
+    }
+    .scoreboard-team {
+        font-size: 1.3rem;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+    }
+    .scoreboard-score {
+        font-family: 'Teko', sans-serif;
+        font-size: 5rem;
+        line-height: 1;
+        font-weight: 700;
+        color: #ffffff;
+    }
+    .scoreboard-vs {
+        font-family: 'Teko', sans-serif;
+        font-size: 2.2rem;
+        color: #64748b;
+        margin-top: 15px;
+    }
+
+    .stat-pill {
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 12px;
+        padding: 12px;
+        text-align: center;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .stat-value {
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: #38bdf8;
+    }
+    .stat-label {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        color: #94a3b8;
+        letter-spacing: 1px;
+    }
+
+    div.stButton > button {
+        background: linear-gradient(90deg, #f97316 0%, #ea580c 100%);
+        color: white;
+        font-weight: 700;
+        font-size: 1.1rem;
+        border-radius: 12px;
+        border: none;
+        padding: 0.75rem 2rem;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(234, 88, 12, 0.35);
+    }
+    div.stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(234, 88, 12, 0.55);
+        color: white;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+with st.sidebar:
+    st.markdown("### ⚙️ Parametry Silnika")
+    sim_date = st.date_input(
+        "Data odniesienia formy:",
+        value=date(2024, 4, 14),
+        min_value=date(2018, 1, 1),
+        max_value=date(2024, 6, 30),
+        help="Określa horyzont czasowy, z którego wyliczane są rolling features i wagi graczy.",
+    )
+    date_str = sim_date.strftime("%Y-%m-%d")
+    st.info(f"Stan bazy do: **{date_str}**")
+
+
+@st.cache_data(ttl=3600)
+def cached_roster(team_id: int, ref_date: str) -> dict[str, float]:
+    return get_player_impacts(team_id, end_date=ref_date)
+
+
+teams_map = get_all_teams()
+team_names = sorted(list(teams_map.keys()))
+
+st.markdown(
+    '<div class="main-header">NBA Matchday Engine</div>', unsafe_allow_html=True
+)
+st.markdown(
+    '<div class="sub-header">Symulator spotkań NBA zasilany modelem LightGBM z korektą absencji rotacyjnych</div>',
+    unsafe_allow_html=True,
+)
+
+c1, c2 = st.columns(2)
+
+with c1:
+    st.markdown('<div class="team-card home-glow">', unsafe_allow_html=True)
+    st.markdown("#### 🏠 Drużyna Gospodarzy")
+    home_team = st.selectbox(
+        "Gospodarz",
+        team_names,
+        index=team_names.index("Boston Celtics")
+        if "Boston Celtics" in team_names
+        else 0,
+        label_visibility="collapsed",
+    )
+    home_rest = st.slider("Dni odpoczynku", 0, 5, 2, key="h_rest")
+    h_roster = cached_roster(teams_map[home_team], date_str)
+    h_out = st.multiselect(
+        "Raport kontuzji / nieobecni:",
+        options=list(h_roster.keys()),
+        format_func=lambda name: f"{name} (-{h_roster[name]} pkt)",
+        key="h_out_select",
+    )
+    h_impact = sum(h_roster[p] for p in h_out)
+    st.caption(f"Osłabienie formacji: **-{h_impact:.1f} pkt**")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with c2:
+    st.markdown('<div class="team-card away-glow">', unsafe_allow_html=True)
+    st.markdown("#### ✈️ Drużyna Gości")
+    away_team = st.selectbox(
+        "Gość",
+        team_names,
+        index=team_names.index("Dallas Mavericks")
+        if "Dallas Mavericks" in team_names
+        else 1,
+        label_visibility="collapsed",
+    )
+    away_rest = st.slider("Dni odpoczynku", 0, 5, 1, key="a_rest")
+    a_roster = cached_roster(teams_map[away_team], date_str)
+    a_out = st.multiselect(
+        "Raport kontuzji / nieobecni:",
+        options=list(a_roster.keys()),
+        format_func=lambda name: f"{name} (-{a_roster[name]} pkt)",
+        key="a_out_select",
+    )
+    a_impact = sum(a_roster[p] for p in a_out)
+    st.caption(f"Osłabienie formacji: **-{a_impact:.1f} pkt**")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+simulate_btn = st.button("Uruchom Symulację Matchupu", use_container_width=True)
+
+if simulate_btn:
+    if home_team == away_team:
+        st.error("Wybierz dwie różne drużyny!")
+    else:
+        with st.spinner("Przetwarzanie wskaźników ligowych i generowanie wyniku..."):
+            try:
+                h_stats = get_team_stats(teams_map[home_team], end_date=date_str)
+                a_stats = get_team_stats(teams_map[away_team], end_date=date_str)
+
+                res = predict_match(
+                    home_stats=h_stats,
+                    away_stats=a_stats,
+                    home_rest=home_rest,
+                    away_rest=away_rest,
+                    home_absent_impact=h_impact,
+                    away_absent_impact=a_impact,
+                )
+            except Exception as err:
+                st.error(f"Błąd silnika symulacji: {err}")
+                st.stop()
+
+        # SCOREBOARD SECTION
+        st.markdown(
+            f"""
+            <div class="scoreboard">
+                <div style="display: flex; justify-content: space-around; align-items: center;">
+                    <div style="flex: 2;">
+                        <div class="scoreboard-team" style="color: #60a5fa;">{home_team}</div>
+                        <div class="scoreboard-score">{round(res["pts_home"])}</div>
+                    </div>
+                    <div class="scoreboard-vs" style="flex: 1;">VS</div>
+                    <div style="flex: 2;">
+                        <div class="scoreboard-team" style="color: #f87171;">{away_team}</div>
+                        <div class="scoreboard-score">{round(res["pts_away"])}</div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # SZANSE WYGRANEJ I PROGNOZY
+        st.markdown("##### Szanse na zwycięstwo")
+        prob_h = res["prob_home"]
+        prob_a = res["prob_away"]
+        st.markdown(
+            f"""
+            <div style="display: flex; justify-content: space-between; font-weight: 700; margin-bottom: 6px;">
+                <span style="color: #60a5fa;">{home_team} {prob_h:.1f}%</span>
+                <span style="color: #f87171;">{prob_a:.1f}% {away_team}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.progress(prob_h / 100.0)
+
+        st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+
+        # STATYSTYKI MECZOWE
+        spread_text = f"+{res['spread']}" if res["spread"] > 0 else f"{res['spread']}"
+        m_col1, m_col2, m_col3 = st.columns(3)
+        with m_col1:
+            st.markdown(
+                f"""
+                <div class="stat-pill">
+                    <div class="stat-label">Model Spread</div>
+                    <div class="stat-value">{spread_text} pkt</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with m_col2:
+            st.markdown(
+                f"""
+                <div class="stat-pill">
+                    <div class="stat-label">Suma Punktów (O/U)</div>
+                    <div class="stat-value">{res["total"]:.1f}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with m_col3:
+            st.markdown(
+                f"""
+                <div class="stat-pill">
+                    <div class="stat-label">Przewidywane Tempo (Pace)</div>
+                    <div class="stat-value">{res["projected_pace"]:.1f}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # WERYFIKACJA (GROUND TRUTH)
+        try:
+            df_games = pd.read_csv("csv/game.csv")
+            df_games["game_date"] = pd.to_datetime(df_games["game_date"])
+
+            actual_match = df_games[
+                (df_games["game_date"] == pd.to_datetime(date_str))
+                & (df_games["team_id_home"] == teams_map[home_team])
+                & (df_games["team_id_away"] == teams_map[away_team])
+            ]
+
+            if not actual_match.empty:
+                st.markdown("<div style='height: 25px;'></div>", unsafe_allow_html=True)
+                st.markdown("#### 🎯 Weryfikacja z wynikiem rzeczywistym")
+
+                real_pts_h = int(actual_match.iloc[0]["pts_home"])
+                real_pts_a = int(actual_match.iloc[0]["pts_away"])
+                real_spread = real_pts_h - real_pts_a
+
+                g1, g2, g3 = st.columns(3)
+                g1.metric("Wynik Oficjalny", f"{real_pts_h} : {real_pts_a}")
+                spread_error = abs(res["spread"] - real_spread)
+                g2.metric("Odchylenie Spreadu", f"{spread_error:.1f} pkt")
+                winner_hit = (res["spread"] > 0) == (real_spread > 0)
+                g3.metric(
+                    "Trafiony Zwycięzca",
+                    "TAK ✅" if winner_hit else "NIE ❌",
+                )
+        except Exception:
+            pass

@@ -25,41 +25,83 @@ def find_player_impact(df_inactive: pd.DataFrame) -> pd.DataFrame:
             "gameDate": "game_date",
         }
     )
-    df = df.dropna(subset=["game_id", "player_id", "team_id"]).copy()
-    df_inactive = df_inactive.dropna(subset=["game_id", "player_id"]).copy()
 
+    df = df.dropna(subset=["game_id", "player_id", "team_id", "game_date"]).copy()
     df["game_date"] = pd.to_datetime(df["game_date"])
     df = df[df["game_date"] >= "2015-09-01"].copy()
-    df["game_id"] = df["game_id"].astype("int64")
-    df["player_id"] = df["player_id"].astype("int64")
-    df["team_id"] = df["team_id"].astype("int64")
-
-    df_inactive["game_id"] = df_inactive["game_id"].astype("int64")
-    df_inactive["player_id"] = df_inactive["player_id"].astype("int64")
-
-    df["min"] = pd.to_numeric(df["min"], errors="coerce")
-    df["min"] = df["min"].fillna(0)
-    df["pts"] = pd.to_numeric(df["pts"], errors="coerce")
-    df["pts"] = df["pts"].fillna(0)
-
-    df = df.sort_values(by=["player_id", "game_id"]).reset_index(drop=True)
-    group = df.groupby("player_id")[["pts", "min"]]
-    avg = group.shift(1).rolling(7, min_periods=3).mean()
-    df["wage"] = avg["pts"] * (avg["min"] / 48.0)
-
-    merged = df_inactive.merge(
-        df[["game_id", "player_id", "wage"]], on=["game_id", "player_id"]
+    df["game_id"] = (
+        pd.to_numeric(df["game_id"], errors="coerce").fillna(0).astype("int64")
+    )
+    df["player_id"] = (
+        pd.to_numeric(df["player_id"], errors="coerce").fillna(0).astype("int64")
+    )
+    df["team_id"] = (
+        pd.to_numeric(df["team_id"], errors="coerce").fillna(0).astype("int64")
     )
 
-    result = merged.groupby(["game_id", "team_id"], as_index=False)["wage"].sum()
-    result.columns = ["game_id", "team_id", "impact"]
+    df["min"] = pd.to_numeric(
+        df["min"].astype(str).str.split(":").str[0],
+        errors="coerce",
+    ).fillna(0.0)
+    df["pts"] = pd.to_numeric(df["pts"], errors="coerce").fillna(0.0)
+
+    df = df.sort_values(by=["player_id", "game_date"]).reset_index(drop=True)
+
+    group = df.groupby("player_id")[["pts", "min"]]
+    rolling_stats = group.shift(1).rolling(7, min_periods=2).mean()
+
+    pts_avg = rolling_stats["pts"].fillna(0.0)
+    min_avg = rolling_stats["min"].fillna(0.0)
+
+    raw_wage = pts_avg * (min_avg / 48.0)
+    df["wage"] = np.where(min_avg >= 12.0, raw_wage, 0.0)
+
+    player_game_weights = df.drop_duplicates(subset=["game_id", "player_id"])[
+        ["game_id", "player_id", "wage"]
+    ]
+
+    df_inactive = df_inactive.dropna(subset=["game_id", "player_id", "team_id"]).copy()
+    df_inactive["game_id"] = (
+        pd.to_numeric(df_inactive["game_id"], errors="coerce").fillna(0).astype("int64")
+    )
+    df_inactive["player_id"] = (
+        pd.to_numeric(df_inactive["player_id"], errors="coerce")
+        .fillna(0)
+        .astype("int64")
+    )
+    df_inactive["team_id"] = (
+        pd.to_numeric(df_inactive["team_id"], errors="coerce").fillna(0).astype("int64")
+    )
+
+    merged = df_inactive.merge(
+        player_game_weights,
+        on=["game_id", "player_id"],
+        how="left",
+    )
+
+    latest_player_wages = (
+        df.sort_values("game_date")
+        .groupby("player_id")["wage"]
+        .last()
+        .reset_index()
+        .rename(columns={"wage": "fallback_wage"})
+    )
+    merged = merged.merge(latest_player_wages, on="player_id", how="left")
+    merged["wage"] = merged["wage"].fillna(merged["fallback_wage"]).fillna(0.0)
+
+    merged = merged[merged["wage"] >= 1.0]
+
+    result = (
+        merged.groupby(["game_id", "team_id"], as_index=False)["wage"]
+        .sum()
+        .rename(columns={"wage": "impact"})
+    )
 
     return result
 
 
 def process_data(
     game: str = "csv/game.csv",
-    other_stats: str = "csv/other_stats.csv",
     inactive: str = "csv/inactive_players.csv",
     output: str = "training_data.csv",
 ) -> pd.DataFrame:
@@ -69,7 +111,7 @@ def process_data(
     df = df[df["game_date"] >= "2015-10-01"].copy()
     df = df.sort_values(by=["game_date"]).reset_index(drop=True)
     df = df.dropna(subset=["pts_home", "pts_away", "min", "fga_home", "fga_away"])
-    # Liczenie średniej ilośći posiadań zgodnie z ogoólnodostępnym wzorem
+
     possesion_home = (
         df["fga_home"] + 0.44 * df["fta_home"] - df["oreb_home"] + df["tov_home"]
     )
@@ -108,6 +150,7 @@ def process_data(
     df["impact_home"] = df["impact_home"].fillna(0.0)
     df["impact_away"] = df["impact_away"].fillna(0.0)
     df["impact_spread"] = df["impact_away"] - df["impact_home"]
+    df["impact_total"] = df["impact_home"] + df["impact_away"]
 
     home = pd.DataFrame(
         {
@@ -148,10 +191,7 @@ def process_data(
         "pace",
     ]
     for col in cols:
-        team_stats[f"avg_{col}"] = (
-            ## shift zapobiega data lekage
-            group[col].shift(1).rolling(7, min_periods=3).mean()
-        )
+        team_stats[f"avg_{col}"] = group[col].shift(1).rolling(7, min_periods=3).mean()
     team_stats["net_rating"] = team_stats["avg_ortg"] - team_stats["avg_drtg"]
 
     for col in ["ortg", "drtg", "pace"]:
@@ -162,16 +202,15 @@ def process_data(
     team_stats["long_net_rating"] = (
         team_stats["long_avg_ortg"] - team_stats["long_avg_drtg"]
     )
-    ## shift znowu zapobiega data leckage
     days_diff = (team_stats["game_date"] - group["game_date"].shift(1)).dt.days
-    team_stats["rest_days"] = days_diff.fillna(3).clip(lower=0, upper=7)
-    team_stats["b2b"] = (team_stats["rest_days"] <= 1).astype(int)
+    team_stats["rest_days"] = days_diff.fillna(2).clip(lower=0, upper=2)
+    team_stats["b2b"] = (team_stats["rest_days"] == 0).astype(int)
 
     features_cols = (
         [f"avg_{col}" for col in cols]
         + ["rest_days", "net_rating"]
         + [f"long_avg_{col}" for col in ["ortg", "drtg", "pace"]]
-        + ["long_net_rating", "rest_days", "b2b"]
+        + ["long_net_rating", "b2b"]
     )
 
     sub_home = team_stats.loc[team_stats["is_home"] == 1]
@@ -192,6 +231,7 @@ def process_data(
             "impact_home",
             "impact_away",
             "impact_spread",
+            "impact_total",
         ]
     ].copy()
 
@@ -208,5 +248,7 @@ def process_data(
     return result
 
 
-result = process_data()
-print(result.head())
+if __name__ == "__main__":
+    result = process_data()
+    print("Przetwarzanie zakończone pomyślnie. Wymiary zbioru:", result.shape)
+    print(result.head())

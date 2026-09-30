@@ -32,9 +32,7 @@ def get_team_stats(team_id: int, end_date: str = "2024-04-01") -> dict[str, floa
         + away["tov_away"]
     )
 
-    combined = (
-        pd.concat([home, away], ignore_index=True).sort_values("game_date").tail(7)
-    )
+    combined = pd.concat([home, away], ignore_index=True).sort_values("game_date")
     if len(combined) < 3:
         raise ValueError(f"Zbyt mało meczów dla drużyny ID {team_id} przed {end_date}.")
 
@@ -70,7 +68,9 @@ def get_player_impacts(team_id: int, end_date: str = "2024-04-01") -> dict[str, 
     df = pd.read_csv(
         "csv/PlayerStatistics.csv",
         usecols=[
-            "playerName",
+            "firstName",
+            "lastName",
+            "personId",
             "playerteamId",
             "numMinutes",
             "points",
@@ -78,22 +78,47 @@ def get_player_impacts(team_id: int, end_date: str = "2024-04-01") -> dict[str, 
         ],
         low_memory=False,
     )
-    df = df[df["playerteamId"] == team_id].dropna().copy()
-    if df.empty:
+    df["gameDate"] = pd.to_datetime(df["gameDate"])
+    target_date = pd.to_datetime(end_date)
+    start_window = target_date - pd.Timedelta(days=365)
+
+    df_window = df[
+        (df["gameDate"] <= target_date) & (df["gameDate"] >= start_window)
+    ].copy()
+    if df_window.empty:
         return {}
 
-    df["gameDate"] = pd.to_datetime(df["gameDate"])
-    df = df[df["gameDate"] <= pd.to_datetime(end_date)]
+    last_game_per_player = df_window.sort_values("gameDate").groupby("personId").last()
+    current_team_players = last_game_per_player[
+        last_game_per_player["playerteamId"] == team_id
+    ].index
 
-    df["min"] = pd.to_numeric(
-        df["numMinutes"].astype(str).str.split(":").str[0],
+    df_team = df_window[
+        (df_window["playerteamId"] == team_id)
+        & (df_window["personId"].isin(current_team_players))
+    ].copy()
+
+    if df_team.empty:
+        return {}
+
+    df_team["playerName"] = (
+        df_team["firstName"].fillna("")
+        + " "
+        + df_team["lastName"].fillna("")
+        + " (#"
+        + df_team["personId"].astype(str)
+        + ")"
+    ).str.strip()
+
+    df_team["min"] = pd.to_numeric(
+        df_team["numMinutes"].astype(str).str.split(":").str[0],
         errors="coerce",
     ).fillna(0.0)
-    df["pts"] = pd.to_numeric(df["points"], errors="coerce").fillna(0.0)
+    df_team["pts"] = pd.to_numeric(df_team["points"], errors="coerce").fillna(0.0)
 
-    df = df.sort_values("gameDate")
+    df_team = df_team.sort_values("gameDate")
 
-    recent_matches = df.groupby("playerName").tail(7)
+    recent_matches = df_team.groupby("playerName").tail(7)
     stats = recent_matches.groupby("playerName").agg(
         pts=("pts", "mean"), min=("min", "mean"), games=("pts", "count")
     )
